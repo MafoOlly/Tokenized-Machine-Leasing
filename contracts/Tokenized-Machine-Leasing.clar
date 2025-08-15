@@ -12,6 +12,9 @@
 (define-constant ERR-LEASE-ACTIVE (err u107))
 (define-constant ERR-NOT-OWNER (err u108))
 (define-constant ERR-MACHINE-EXISTS (err u109))
+(define-constant ERR-MAINTENANCE-SCHEDULED (err u110))
+(define-constant ERR-MAINTENANCE-NOT-FOUND (err u111))
+(define-constant ERR-INVALID-MAINTENANCE-PERIOD (err u112))
 
 (define-data-var next-machine-id uint u1)
 (define-data-var platform-fee-rate uint u250)
@@ -40,6 +43,16 @@
 
 (define-map factory-earnings principal uint)
 (define-map platform-earnings principal uint)
+
+(define-map machine-maintenance
+  uint
+  {
+    start-block: uint,
+    end-block: uint,
+    description: (string-ascii 128),
+    is-active: bool
+  }
+)
 
 (define-public (tokenize-machine (name (string-ascii 64)) (hourly-rate uint))
   (let 
@@ -81,6 +94,7 @@
     (asserts! (get is-active machine-data) ERR-NOT-AUTHORIZED)
     (asserts! (> duration-blocks u0) ERR-INVALID-DURATION)
     (asserts! (>= duration-blocks u144) ERR-INVALID-DURATION)
+    (asserts! (not (is-maintenance-scheduled machine-id)) ERR-MAINTENANCE-SCHEDULED)
     
     (match current-lease
       lease-info (asserts! (not (get is-active lease-info)) ERR-ALREADY-LEASED)
@@ -213,6 +227,72 @@
   )
 )
 
+(define-public (schedule-maintenance (machine-id uint) (start-block uint) (duration-blocks uint) (description (string-ascii 128)))
+  (let 
+    (
+      (machine-data (unwrap! (map-get? machines machine-id) ERR-MACHINE-NOT-FOUND))
+      (current-lease (map-get? machine-leases machine-id))
+      (end-block (+ start-block duration-blocks))
+    )
+    (asserts! (is-eq tx-sender (get factory machine-data)) ERR-NOT-OWNER)
+    (asserts! (> duration-blocks u0) ERR-INVALID-MAINTENANCE-PERIOD)
+    (asserts! (> start-block stacks-block-height) ERR-INVALID-MAINTENANCE-PERIOD)
+    (asserts! (> (len description) u0) ERR-INVALID-MAINTENANCE-PERIOD)
+    
+    (match current-lease
+      lease-info (asserts! (or (not (get is-active lease-info)) (>= start-block (get end-block lease-info))) ERR-LEASE-ACTIVE)
+      true
+    )
+    
+    (map-set machine-maintenance machine-id {
+      start-block: start-block,
+      end-block: end-block,
+      description: description,
+      is-active: true
+    })
+    
+    (ok {
+      maintenance-start: start-block,
+      maintenance-end: end-block,
+      description: description
+    })
+  )
+)
+
+(define-public (cancel-maintenance (machine-id uint))
+  (let 
+    (
+      (machine-data (unwrap! (map-get? machines machine-id) ERR-MACHINE-NOT-FOUND))
+      (maintenance-data (unwrap! (map-get? machine-maintenance machine-id) ERR-MAINTENANCE-NOT-FOUND))
+    )
+    (asserts! (is-eq tx-sender (get factory machine-data)) ERR-NOT-OWNER)
+    (asserts! (get is-active maintenance-data) ERR-MAINTENANCE-NOT-FOUND)
+    (asserts! (> (get start-block maintenance-data) stacks-block-height) ERR-INVALID-MAINTENANCE-PERIOD)
+    
+    (map-set machine-maintenance machine-id 
+      (merge maintenance-data { is-active: false }))
+    
+    (ok true)
+  )
+)
+
+(define-public (complete-maintenance (machine-id uint))
+  (let 
+    (
+      (machine-data (unwrap! (map-get? machines machine-id) ERR-MACHINE-NOT-FOUND))
+      (maintenance-data (unwrap! (map-get? machine-maintenance machine-id) ERR-MAINTENANCE-NOT-FOUND))
+    )
+    (asserts! (is-eq tx-sender (get factory machine-data)) ERR-NOT-OWNER)
+    (asserts! (get is-active maintenance-data) ERR-MAINTENANCE-NOT-FOUND)
+    (asserts! (>= stacks-block-height (get start-block maintenance-data)) ERR-INVALID-MAINTENANCE-PERIOD)
+    
+    (map-set machine-maintenance machine-id 
+      (merge maintenance-data { is-active: false }))
+    
+    (ok true)
+  )
+)
+
 (define-public (update-platform-fee (new-rate uint))
   (begin
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
@@ -251,8 +331,12 @@
           (and 
             (get is-active machine-data)
             (not (get is-active lease-data))
+            (not (is-maintenance-scheduled machine-id))
           )
-        (get is-active machine-data)
+        (and 
+          (get is-active machine-data)
+          (not (is-maintenance-scheduled machine-id))
+        )
       )
     false
   )
@@ -311,4 +395,51 @@
 
 (define-read-only (get-owner (id uint)) 
   (ok (nft-get-owner? machine id))
+)
+
+(define-read-only (get-machine-maintenance (machine-id uint))
+  (map-get? machine-maintenance machine-id)
+)
+
+(define-read-only (is-maintenance-scheduled (machine-id uint))
+  (match (map-get? machine-maintenance machine-id)
+    maintenance-data
+      (and 
+        (get is-active maintenance-data)
+        (or 
+          (and 
+            (> (get start-block maintenance-data) stacks-block-height)
+            (< stacks-block-height (get end-block maintenance-data))
+          )
+          (and 
+            (<= (get start-block maintenance-data) stacks-block-height)
+            (< stacks-block-height (get end-block maintenance-data))
+          )
+        )
+      )
+    false
+  )
+)
+
+(define-read-only (is-maintenance-active (machine-id uint))
+  (match (map-get? machine-maintenance machine-id)
+    maintenance-data
+      (and 
+        (get is-active maintenance-data)
+        (<= (get start-block maintenance-data) stacks-block-height)
+        (< stacks-block-height (get end-block maintenance-data))
+      )
+    false
+  )
+)
+
+(define-read-only (get-maintenance-time-remaining (machine-id uint))
+  (match (map-get? machine-maintenance machine-id)
+    maintenance-data
+      (if (and (get is-active maintenance-data) (< stacks-block-height (get end-block maintenance-data)))
+        (some (- (get end-block maintenance-data) stacks-block-height))
+        none
+      )
+    none
+  )
 )
