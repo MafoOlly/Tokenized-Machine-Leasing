@@ -15,9 +15,14 @@
 (define-constant ERR-MAINTENANCE-SCHEDULED (err u110))
 (define-constant ERR-MAINTENANCE-NOT-FOUND (err u111))
 (define-constant ERR-INVALID-MAINTENANCE-PERIOD (err u112))
+(define-constant ERR-USAGE-THRESHOLD-NOT-MET (err u113))
+(define-constant ERR-INVALID-KPI (err u114))
+(define-constant ERR-SERVICE-ALREADY-COMPLETED (err u115))
 
 (define-data-var next-machine-id uint u1)
 (define-data-var platform-fee-rate uint u250)
+(define-data-var maintenance-threshold-hours uint u1000)
+(define-data-var service-request-counter uint u0)
 
 (define-map machines 
   uint 
@@ -54,6 +59,57 @@
   }
 )
 
+(define-map machine-usage-stats
+  uint
+  {
+    total-hours-used: uint,
+    total-leases: uint,
+    last-service-block: uint,
+    hours-since-service: uint,
+    efficiency-rating: uint,
+    uptime-percentage: uint,
+    maintenance-score: uint
+  }
+)
+
+(define-map machine-kpis
+  uint
+  {
+    avg-utilization: uint,
+    peak-performance: uint,
+    failure-count: uint,
+    service-intervals: uint,
+    predicted-next-service: uint,
+    health-status: (string-ascii 20)
+  }
+)
+
+(define-map service-requests
+  uint
+  {
+    machine-id: uint,
+    request-type: (string-ascii 50),
+    priority: uint,
+    requested-at: uint,
+    completed-at: (optional uint),
+    service-provider: (optional principal),
+    estimated-duration: uint,
+    cost-estimate: uint,
+    is-automated: bool
+  }
+)
+
+(define-map maintenance-history
+  { machine-id: uint, service-block: uint }
+  {
+    service-type: (string-ascii 50),
+    duration: uint,
+    cost: uint,
+    performance-impact: int,
+    next-recommended: uint
+  }
+)
+
 (define-public (tokenize-machine (name (string-ascii 64)) (hourly-rate uint))
   (let 
     (
@@ -70,6 +126,25 @@
       hourly-rate: hourly-rate,
       is-active: true,
       created-at: stacks-block-height
+    })
+    
+    (map-set machine-usage-stats machine-id {
+      total-hours-used: u0,
+      total-leases: u0,
+      last-service-block: stacks-block-height,
+      hours-since-service: u0,
+      efficiency-rating: u100,
+      uptime-percentage: u10000,
+      maintenance-score: u100
+    })
+    
+    (map-set machine-kpis machine-id {
+      avg-utilization: u0,
+      peak-performance: u0,
+      failure-count: u0,
+      service-intervals: u0,
+      predicted-next-service: (+ stacks-block-height (var-get maintenance-threshold-hours)),
+      health-status: "Healthy"
     })
     
     (var-set next-machine-id (+ machine-id u1))
@@ -116,6 +191,16 @@
     
     (map-set platform-earnings CONTRACT-OWNER 
       (+ (default-to u0 (map-get? platform-earnings CONTRACT-OWNER)) platform-fee))
+    
+    (let ((usage-stats (unwrap! (map-get? machine-usage-stats machine-id) ERR-MACHINE-NOT-FOUND)))
+      (map-set machine-usage-stats machine-id 
+        (merge usage-stats {
+          total-hours-used: (+ (get total-hours-used usage-stats) total-hours),
+          total-leases: (+ (get total-leases usage-stats) u1),
+          hours-since-service: (+ (get hours-since-service usage-stats) total-hours)
+        })))
+    
+    (try! (check-for-maintenance-triggers machine-id))
     
     (ok {
       lease-start: stacks-block-height,
@@ -442,4 +527,153 @@
       )
     none
   )
+)
+
+(define-private (check-for-maintenance-triggers (machine-id uint))
+  (let 
+    (
+      (usage-stats (unwrap! (map-get? machine-usage-stats machine-id) ERR-MACHINE-NOT-FOUND))
+      (kpis (unwrap! (map-get? machine-kpis machine-id) ERR-MACHINE-NOT-FOUND))
+    )
+    (if (>= (get hours-since-service usage-stats) (var-get maintenance-threshold-hours))
+      (begin
+        (try! (schedule-maintenance 
+          machine-id 
+          (get predicted-next-service kpis) 
+          u144 
+          "Automated usage-based maintenance"))
+        (ok true))
+      (ok false)
+    )
+  )
+)
+
+(define-public (update-machine-kpis (machine-id uint) (avg-utilization uint) (peak-performance uint) (failure-count uint) (health-status (string-ascii 20)))
+  (let 
+    (
+      (machine-data (unwrap! (map-get? machines machine-id) ERR-MACHINE-NOT-FOUND))
+      (kpis (unwrap! (map-get? machine-kpis machine-id) ERR-MACHINE-NOT-FOUND))
+    )
+    (asserts! (is-eq tx-sender (get factory machine-data)) ERR-NOT-OWNER)
+    (asserts! (<= avg-utilization u100) ERR-INVALID-KPI)
+    (asserts! (<= peak-performance u100) ERR-INVALID-KPI)
+    (asserts! (> (len health-status) u0) ERR-INVALID-KPI)
+    
+    (map-set machine-kpis machine-id 
+      (merge kpis {
+        avg-utilization: avg-utilization,
+        peak-performance: peak-performance,
+        failure-count: failure-count,
+        health-status: health-status
+      }))
+    
+    (ok true)
+  )
+)
+
+(define-public (request-manual-service (machine-id uint) (request-type (string-ascii 50)) (priority uint) (duration uint) (cost uint))
+  (let 
+    (
+      (machine-data (unwrap! (map-get? machines machine-id) ERR-MACHINE-NOT-FOUND))
+      (request-id (+ (var-get service-request-counter) u1))
+    )
+    (asserts! (is-eq tx-sender (get factory machine-data)) ERR-NOT-OWNER)
+    (asserts! (> (len request-type) u0) ERR-INVALID-KPI)
+    
+    (map-set service-requests request-id {
+      machine-id: machine-id,
+      request-type: request-type,
+      priority: priority,
+      requested-at: stacks-block-height,
+      completed-at: none,
+      service-provider: none,
+      estimated-duration: duration,
+      cost-estimate: cost,
+      is-automated: false
+    })
+    
+    (var-set service-request-counter request-id)
+    (ok request-id)
+  )
+)
+
+(define-public (complete-service-request (request-id uint) (service-provider principal))
+  (let 
+    (
+      (service-req (unwrap! (map-get? service-requests request-id) ERR-MAINTENANCE-NOT-FOUND))
+      (machine-id (get machine-id service-req))
+      (usage-stats (unwrap! (map-get? machine-usage-stats machine-id) ERR-MACHINE-NOT-FOUND))
+    )
+    (asserts! (is-none (get completed-at service-req)) ERR-SERVICE-ALREADY-COMPLETED)
+    
+    (map-set service-requests request-id 
+      (merge service-req {
+        completed-at: (some stacks-block-height),
+        service-provider: (some service-provider)
+      }))
+    
+    (map-set machine-usage-stats machine-id 
+      (merge usage-stats {
+        last-service-block: stacks-block-height,
+        hours-since-service: u0
+      }))
+    
+    (map-set maintenance-history { machine-id: machine-id, service-block: stacks-block-height } {
+      service-type: (get request-type service-req),
+      duration: (get estimated-duration service-req),
+      cost: (get cost-estimate service-req),
+      performance-impact: 10,
+      next-recommended: (+ stacks-block-height (var-get maintenance-threshold-hours))
+    })
+    
+    (ok true)
+  )
+)
+
+(define-public (set-maintenance-threshold (new-threshold uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (> new-threshold u0) ERR-INVALID-DURATION)
+    
+    (var-set maintenance-threshold-hours new-threshold)
+    (ok true)
+  )
+)
+
+(define-read-only (get-machine-usage-stats (machine-id uint))
+  (map-get? machine-usage-stats machine-id)
+)
+
+(define-read-only (get-machine-kpis (machine-id uint))
+  (map-get? machine-kpis machine-id)
+)
+
+(define-read-only (get-service-request (request-id uint))
+  (map-get? service-requests request-id)
+)
+
+(define-read-only (get-maintenance-history (machine-id uint) (service-block uint))
+  (map-get? maintenance-history { machine-id: machine-id, service-block: service-block })
+)
+
+(define-read-only (get-predicted-maintenance-status (machine-id uint))
+  (let 
+    (
+      (usage-stats (map-get? machine-usage-stats machine-id))
+      (kpis (map-get? machine-kpis machine-id))
+    )
+    (if (and (is-some usage-stats) (is-some kpis))
+      (some {
+        hours-since-service: (get hours-since-service (unwrap-panic usage-stats)),
+        predicted-next-service: (get predicted-next-service (unwrap-panic kpis)),
+        health-status: (get health-status (unwrap-panic kpis)),
+        maintenance-score: (get maintenance-score (unwrap-panic usage-stats))
+      })
+      none
+    )
+  )
+)
+
+(define-read-only (get-maintenance-threshold)
+  (var-get maintenance-threshold-hours)
 )
