@@ -18,6 +18,8 @@
 (define-constant ERR-USAGE-THRESHOLD-NOT-MET (err u113))
 (define-constant ERR-INVALID-KPI (err u114))
 (define-constant ERR-SERVICE-ALREADY-COMPLETED (err u115))
+(define-constant ERR-INVALID-PRICING-PARAMS (err u116))
+(define-constant ERR-PRICING-DISABLED (err u117))
 
 (define-data-var next-machine-id uint u1)
 (define-data-var platform-fee-rate uint u250)
@@ -110,6 +112,29 @@
   }
 )
 
+(define-map dynamic-pricing-config
+  uint
+  {
+    base-rate: uint,
+    demand-multiplier: uint,
+    utilization-discount: uint,
+    peak-hours-multiplier: uint,
+    performance-bonus: uint,
+    enabled: bool,
+    min-rate: uint,
+    max-rate: uint
+  }
+)
+
+(define-map machine-demand-metrics
+  uint
+  {
+    lease-requests-count: uint,
+    recent-block-height: uint,
+    demand-score: uint
+  }
+)
+
 (define-public (tokenize-machine (name (string-ascii 64)) (hourly-rate uint))
   (let 
     (
@@ -157,10 +182,11 @@
     (
       (machine-data (unwrap! (map-get? machines machine-id) ERR-MACHINE-NOT-FOUND))
       (current-lease (map-get? machine-leases machine-id))
-      (hourly-rate (get hourly-rate machine-data))
+      (base-hourly-rate (get hourly-rate machine-data))
+      (effective-rate (get-effective-pricing machine-id base-hourly-rate))
       (blocks-per-hour u144)
       (total-hours (/ duration-blocks blocks-per-hour))
-      (total-cost (* total-hours hourly-rate))
+      (total-cost (* total-hours effective-rate))
       (platform-fee (/ (* total-cost (var-get platform-fee-rate)) u10000))
       (factory-payment (- total-cost platform-fee))
       (factory (get factory machine-data))
@@ -175,6 +201,8 @@
       lease-info (asserts! (not (get is-active lease-info)) ERR-ALREADY-LEASED)
       true
     )
+    
+    (unwrap-panic (update-demand-metrics machine-id))
     
     (try! (stx-transfer? total-cost tx-sender (as-contract tx-sender)))
     
@@ -676,4 +704,217 @@
 
 (define-read-only (get-maintenance-threshold)
   (var-get maintenance-threshold-hours)
+)
+
+(define-public (enable-dynamic-pricing 
+  (machine-id uint) 
+  (demand-multiplier uint) 
+  (utilization-discount uint) 
+  (peak-hours-multiplier uint)
+  (performance-bonus uint)
+  (min-rate uint)
+  (max-rate uint))
+  (let 
+    (
+      (machine-data (unwrap! (map-get? machines machine-id) ERR-MACHINE-NOT-FOUND))
+      (base-rate (get hourly-rate machine-data))
+    )
+    (asserts! (is-eq tx-sender (get factory machine-data)) ERR-NOT-OWNER)
+    (asserts! (<= demand-multiplier u300) ERR-INVALID-PRICING-PARAMS)
+    (asserts! (<= utilization-discount u50) ERR-INVALID-PRICING-PARAMS)
+    (asserts! (<= peak-hours-multiplier u200) ERR-INVALID-PRICING-PARAMS)
+    (asserts! (<= performance-bonus u50) ERR-INVALID-PRICING-PARAMS)
+    (asserts! (> min-rate u0) ERR-INVALID-PRICING-PARAMS)
+    (asserts! (> max-rate min-rate) ERR-INVALID-PRICING-PARAMS)
+    
+    (map-set dynamic-pricing-config machine-id {
+      base-rate: base-rate,
+      demand-multiplier: demand-multiplier,
+      utilization-discount: utilization-discount,
+      peak-hours-multiplier: peak-hours-multiplier,
+      performance-bonus: performance-bonus,
+      enabled: true,
+      min-rate: min-rate,
+      max-rate: max-rate
+    })
+    
+    (map-set machine-demand-metrics machine-id {
+      lease-requests-count: u0,
+      recent-block-height: stacks-block-height,
+      demand-score: u100
+    })
+    
+    (ok true)
+  )
+)
+
+(define-public (disable-dynamic-pricing (machine-id uint))
+  (let 
+    (
+      (machine-data (unwrap! (map-get? machines machine-id) ERR-MACHINE-NOT-FOUND))
+      (pricing-config (unwrap! (map-get? dynamic-pricing-config machine-id) ERR-PRICING-DISABLED))
+    )
+    (asserts! (is-eq tx-sender (get factory machine-data)) ERR-NOT-OWNER)
+    
+    (map-set dynamic-pricing-config machine-id 
+      (merge pricing-config { enabled: false }))
+    
+    (ok true)
+  )
+)
+
+(define-public (update-pricing-parameters
+  (machine-id uint)
+  (demand-multiplier uint)
+  (utilization-discount uint)
+  (peak-hours-multiplier uint)
+  (performance-bonus uint))
+  (let 
+    (
+      (machine-data (unwrap! (map-get? machines machine-id) ERR-MACHINE-NOT-FOUND))
+      (pricing-config (unwrap! (map-get? dynamic-pricing-config machine-id) ERR-PRICING-DISABLED))
+    )
+    (asserts! (is-eq tx-sender (get factory machine-data)) ERR-NOT-OWNER)
+    (asserts! (<= demand-multiplier u300) ERR-INVALID-PRICING-PARAMS)
+    (asserts! (<= utilization-discount u50) ERR-INVALID-PRICING-PARAMS)
+    (asserts! (<= peak-hours-multiplier u200) ERR-INVALID-PRICING-PARAMS)
+    (asserts! (<= performance-bonus u50) ERR-INVALID-PRICING-PARAMS)
+    
+    (map-set dynamic-pricing-config machine-id 
+      (merge pricing-config {
+        demand-multiplier: demand-multiplier,
+        utilization-discount: utilization-discount,
+        peak-hours-multiplier: peak-hours-multiplier,
+        performance-bonus: performance-bonus
+      }))
+    
+    (ok true)
+  )
+)
+
+(define-private (update-demand-metrics (machine-id uint))
+  (let 
+    (
+      (current-metrics (default-to 
+        { lease-requests-count: u0, recent-block-height: stacks-block-height, demand-score: u100 }
+        (map-get? machine-demand-metrics machine-id)))
+      (blocks-since-last (- stacks-block-height (get recent-block-height current-metrics)))
+      (new-request-count (+ (get lease-requests-count current-metrics) u1))
+      (demand-score (calculate-demand-score new-request-count blocks-since-last))
+    )
+    (map-set machine-demand-metrics machine-id {
+      lease-requests-count: new-request-count,
+      recent-block-height: stacks-block-height,
+      demand-score: demand-score
+    })
+    
+    (ok true)
+  )
+)
+
+(define-private (calculate-demand-score (request-count uint) (blocks-elapsed uint))
+  (let 
+    (
+      (blocks-per-day u144)
+      (requests-per-day (if (> blocks-elapsed u0)
+        (/ (* request-count blocks-per-day) blocks-elapsed)
+        request-count))
+    )
+    (if (> requests-per-day u10)
+      u200
+      (if (> requests-per-day u5)
+        u150
+        (if (> requests-per-day u2)
+          u120
+          u100
+        )
+      )
+    )
+  )
+)
+
+(define-private (get-effective-pricing (machine-id uint) (base-rate uint))
+  (match (map-get? dynamic-pricing-config machine-id)
+    pricing-config
+      (if (get enabled pricing-config)
+        (let 
+          (
+            (usage-stats (unwrap-panic (map-get? machine-usage-stats machine-id)))
+            (kpis (unwrap-panic (map-get? machine-kpis machine-id)))
+            (demand-metrics (unwrap-panic (map-get? machine-demand-metrics machine-id)))
+            (utilization (get avg-utilization kpis))
+            (performance (get peak-performance kpis))
+            (demand-score (get demand-score demand-metrics))
+            (block-mod (mod stacks-block-height u144))
+            (is-peak-hour (or (< block-mod u36) (> block-mod u108)))
+            
+            (demand-adjustment (/ (* base-rate (- demand-score u100) (get demand-multiplier pricing-config)) u10000))
+            (utilization-adjustment (if (< utilization u30)
+              (- u0 (/ (* base-rate (get utilization-discount pricing-config)) u100))
+              u0))
+            (peak-adjustment (if is-peak-hour
+              (/ (* base-rate (- (get peak-hours-multiplier pricing-config) u100)) u100)
+              u0))
+            (performance-adjustment (if (>= performance u80)
+              (/ (* base-rate (get performance-bonus pricing-config)) u100)
+              u0))
+            
+            (adjusted-rate (+ base-rate (+ demand-adjustment (+ utilization-adjustment (+ peak-adjustment performance-adjustment)))))
+            (min-rate (get min-rate pricing-config))
+            (max-rate (get max-rate pricing-config))
+          )
+          (if (< adjusted-rate min-rate)
+            min-rate
+            (if (> adjusted-rate max-rate)
+              max-rate
+              adjusted-rate
+            )
+          )
+        )
+        base-rate
+      )
+    base-rate
+  )
+)
+
+(define-read-only (get-dynamic-pricing-config (machine-id uint))
+  (map-get? dynamic-pricing-config machine-id)
+)
+
+(define-read-only (get-demand-metrics (machine-id uint))
+  (map-get? machine-demand-metrics machine-id)
+)
+
+(define-read-only (calculate-current-rate (machine-id uint))
+  (match (map-get? machines machine-id)
+    machine-data
+      (some (get-effective-pricing machine-id (get hourly-rate machine-data)))
+    none
+  )
+)
+
+(define-read-only (get-pricing-breakdown (machine-id uint))
+  (match (map-get? dynamic-pricing-config machine-id)
+    pricing-config
+      (if (get enabled pricing-config)
+        (let 
+          (
+            (machine-data (unwrap-panic (map-get? machines machine-id)))
+            (base-rate (get hourly-rate machine-data))
+            (effective-rate (get-effective-pricing machine-id base-rate))
+          )
+          (some {
+            base-rate: base-rate,
+            effective-rate: effective-rate,
+            dynamic-pricing-enabled: true,
+            savings-or-premium: (if (> effective-rate base-rate)
+              (- effective-rate base-rate)
+              (- base-rate effective-rate)
+            )
+          })
+        )
+        none
+      )
+    none
+  )
 )
