@@ -20,6 +20,10 @@
 (define-constant ERR-SERVICE-ALREADY-COMPLETED (err u115))
 (define-constant ERR-INVALID-PRICING-PARAMS (err u116))
 (define-constant ERR-PRICING-DISABLED (err u117))
+(define-constant ERR-ALREADY-RATED (err u118))
+(define-constant ERR-INVALID-RATING (err u119))
+(define-constant ERR-NOT-LESSEE (err u120))
+(define-constant ERR-LEASE-NOT-ENDED (err u121))
 
 (define-data-var next-machine-id uint u1)
 (define-data-var platform-fee-rate uint u250)
@@ -135,6 +139,26 @@
   }
 )
 
+(define-map machine-reputation
+  uint
+  {
+    total-ratings: uint,
+    rating-sum: uint,
+    avg-rating: uint,
+    five-star-count: uint,
+    one-star-count: uint
+  }
+)
+
+(define-map lease-ratings
+  { machine-id: uint, lessee: principal, lease-end-block: uint }
+  {
+    rating: uint,
+    feedback-type: (string-ascii 20),
+    rated-at: uint
+  }
+)
+
 (define-public (tokenize-machine (name (string-ascii 64)) (hourly-rate uint))
   (let 
     (
@@ -170,6 +194,14 @@
       service-intervals: u0,
       predicted-next-service: (+ stacks-block-height (var-get maintenance-threshold-hours)),
       health-status: "Healthy"
+    })
+    
+    (map-set machine-reputation machine-id {
+      total-ratings: u0,
+      rating-sum: u0,
+      avg-rating: u0,
+      five-star-count: u0,
+      one-star-count: u0
     })
     
     (var-set next-machine-id (+ machine-id u1))
@@ -916,5 +948,63 @@
         none
       )
     none
+  )
+)
+
+(define-public (rate-machine (machine-id uint) (rating uint) (feedback-type (string-ascii 20)))
+  (let 
+    (
+      (machine-data (unwrap! (map-get? machines machine-id) ERR-MACHINE-NOT-FOUND))
+      (lease-data (unwrap! (map-get? machine-leases machine-id) ERR-NOT-LEASED))
+      (reputation (unwrap! (map-get? machine-reputation machine-id) ERR-MACHINE-NOT-FOUND))
+      (lease-end-block (get end-block lease-data))
+      (rating-key { machine-id: machine-id, lessee: tx-sender, lease-end-block: lease-end-block })
+    )
+    (asserts! (is-eq tx-sender (get lessee lease-data)) ERR-NOT-LESSEE)
+    (asserts! (not (get is-active lease-data)) ERR-LEASE-NOT-ENDED)
+    (asserts! (and (>= rating u1) (<= rating u5)) ERR-INVALID-RATING)
+    (asserts! (> (len feedback-type) u0) ERR-INVALID-RATING)
+    (asserts! (is-none (map-get? lease-ratings rating-key)) ERR-ALREADY-RATED)
+    
+    (map-set lease-ratings rating-key {
+      rating: rating,
+      feedback-type: feedback-type,
+      rated-at: stacks-block-height
+    })
+    
+    (let 
+      (
+        (new-total-ratings (+ (get total-ratings reputation) u1))
+        (new-rating-sum (+ (get rating-sum reputation) rating))
+        (new-avg-rating (/ new-rating-sum new-total-ratings))
+        (new-five-star (if (is-eq rating u5) (+ (get five-star-count reputation) u1) (get five-star-count reputation)))
+        (new-one-star (if (is-eq rating u1) (+ (get one-star-count reputation) u1) (get one-star-count reputation)))
+      )
+      (map-set machine-reputation machine-id {
+        total-ratings: new-total-ratings,
+        rating-sum: new-rating-sum,
+        avg-rating: new-avg-rating,
+        five-star-count: new-five-star,
+        one-star-count: new-one-star
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-machine-reputation (machine-id uint))
+  (map-get? machine-reputation machine-id)
+)
+
+(define-read-only (get-lease-rating (machine-id uint) (lessee principal) (lease-end-block uint))
+  (map-get? lease-ratings { machine-id: machine-id, lessee: lessee, lease-end-block: lease-end-block })
+)
+
+(define-read-only (is-highly-rated (machine-id uint))
+  (match (map-get? machine-reputation machine-id)
+    rep
+      (and (>= (get total-ratings rep) u5) (>= (get avg-rating rep) u4))
+    false
   )
 )
